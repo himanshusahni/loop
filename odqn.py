@@ -17,9 +17,10 @@ if "../" not in sys.path:
 # from lib import plotting
 from collections import deque, namedtuple
 
-EpisodeStats = namedtuple("Stats",["episode_lengths", "option_lengths", "episode_rewards"])
+EpisodeStats = namedtuple("Stats",["episode_lengths", "option_lengths", "episode_rewards", "avg_q_value", "avg_discounted_return"])
 
 env = gym.envs.make("Breakout-v0")
+env.frameskip=4
 
 # Atari Actions: 0 (noop), 1 (fire), 2 (left) and 3 (right) are valid actions
 # VALID_ACTIONS = [0, 1, 2, 3]
@@ -117,7 +118,7 @@ class Estimator():
         max_option_qs = tf.reduce_max(self.predictions_reshaped, axis=-1)
         option_q_summaries = [tf.summary.scalar(
             "max_q_value_option_{}".format(option),
-            tf.reduce_mean(max_option_qs[:,option])
+            tf.reduce_max(max_option_qs[:,option])
             ) for option in range(self.num_options)]
         self.summaries = tf.summary.merge([
             tf.summary.scalar("loss", self.loss),
@@ -251,7 +252,8 @@ def deep_q_learning(sess,
                     epsilon_decay_steps=500000,
                     batch_size=32,
                     record_video_every=200,
-                    save_every=200):
+                    save_every=200,
+                    test_every=20):
     """
     Q-Learning algorithm for off-policy TD control using Function Approximation.
     Finds the optimal greedy policy while following an epsilon-greedy policy.
@@ -287,10 +289,18 @@ def deep_q_learning(sess,
     replay_memory = []
 
     # Keeps track of useful statistics
-    stats = EpisodeStats(
+    training_stats = EpisodeStats(
         episode_lengths=np.zeros(num_episodes),
         option_lengths=np.zeros(num_episodes),
-        episode_rewards=np.zeros(num_episodes))
+        episode_rewards=np.zeros(num_episodes),
+        avg_q_value=np.zeros(num_episodes),
+        avg_discounted_return=np.zeros(num_episodes))
+    testing_stats = EpisodeStats(
+        episode_lengths=np.zeros(num_episodes//test_every),
+        option_lengths=np.zeros(num_episodes//test_every),
+        episode_rewards=np.zeros(num_episodes//test_every),
+        avg_q_value=np.zeros(num_episodes//test_every),
+        avg_discounted_return=np.zeros(num_episodes//test_every))
 
     # Create directories for checkpoints and summaries
     checkpoint_dir = os.path.join(experiment_dir, "checkpoints")
@@ -357,10 +367,10 @@ def deep_q_learning(sess,
 
     # Record videos
     # Use the gym env Monitor wrapper
-    env = Monitor(env,
-                  directory=monitor_path,
-                  resume=True,
-                  video_callable=lambda count: count % record_video_every ==0)
+    # env = Monitor(env,
+                  # directory=monitor_path,
+                  # resume=True,
+                  # video_callable=lambda count: count % record_video_every ==0)
 
     for i_episode in range(num_episodes):
 
@@ -368,12 +378,85 @@ def deep_q_learning(sess,
         if i_episode % save_every == 0:
             saver.save(tf.get_default_session(), checkpoint_path)
 
+        if i_episode % test_every == 0:
+            # run a testing episode
+            state = env.reset()
+            state = state_processor.process(sess, state)
+            state = np.stack([state] * 4, axis=2)
+            # run the estimator and get all values
+            q_values = q_estimator.predict(sess, np.expand_dims(state, 0))[0]
+            avg_q_value = np.mean(q_values)
+            rewards = []
+
+            option_done = True
+            option = None
+            option_switches = 0
+            loss = None
+
+            epsilon = 0.05
+            # One step in the environment
+            for t in itertools.count():
+                if option_done:
+                    # select a new option
+                    option_probs = policy.option_prob(q_values, epsilon)
+                    option = np.random.choice(np.arange(len(option_probs)), p=option_probs)
+                    option_switches += 1
+                # Take a step
+                action_probs = policy.action_prob(q_values, option, epsilon)
+                action = np.random.choice(np.arange(len(action_probs)), p=action_probs)
+                next_state, reward, done, _ = env.step(VALID_ACTIONS[action])
+                next_state = state_processor.process(sess, next_state)
+                next_state = np.append(state[:,:,1:], np.expand_dims(next_state, 2), axis=2)
+                # Update statistics
+                testing_stats.episode_rewards[i_episode//test_every] += reward
+                testing_stats.episode_lengths[i_episode//test_every] = t
+                rewards.append(reward)
+                if done:
+                    break
+                # get the next set of q values
+                q_values = q_estimator.predict(sess, np.expand_dims(next_state, 0))[0]
+                avg_q_value += np.mean(q_values)
+                # decide whether to terminate option
+                beta_probs = policy.beta_prob(q_values, option, epsilon)
+                option_done = np.random.choice(np.arange(2), p=beta_probs)
+                state = next_state
+
+            testing_stats.option_lengths[i_episode//test_every] = float(t)/option_switches
+            testing_stats.avg_q_value[i_episode//test_every] = avg_q_value/t
+            avg_return = 0
+            gamma_geometric_sum = 1
+            for (k, r) in enumerate(rewards):
+                avg_return += r * gamma_geometric_sum
+                gamma_geometric_sum += np.power(discount_factor, k+1)
+            testing_stats.avg_discounted_return[i_episode//test_every] = avg_return/t
+            # Print out which step we're on, useful for debugging.
+            print("\rTESTING @ Episode {}/{}, Steps {}, Reward: {}, Avg. Option Length: {:.1f}, Episode Length: {}".format(
+                i_episode + 1, num_episodes, total_t,
+                testing_stats.episode_rewards[i_episode//test_every],
+                testing_stats.option_lengths[i_episode//test_every],
+                testing_stats.episode_lengths[i_episode//test_every]),
+                end="")
+            sys.stdout.flush()
+
+            # Add summaries to tensorboard
+            episode_summary = tf.Summary()
+            episode_summary.value.add(simple_value=testing_stats.episode_rewards[i_episode//test_every], node_name="testing/episode_reward", tag="testing/episode_reward")
+            episode_summary.value.add(simple_value=testing_stats.episode_lengths[i_episode//test_every], node_name="testing/episode_length", tag="testing/episode_length")
+            episode_summary.value.add(simple_value=testing_stats.option_lengths[i_episode//test_every], node_name="testing/option_length", tag="testing/option_length")
+            episode_summary.value.add(simple_value=testing_stats.avg_discounted_return[i_episode//test_every], node_name="testing/avg_discounted_return", tag="testing/avg_discounted_return")
+            episode_summary.value.add(simple_value=testing_stats.avg_q_value[i_episode//test_every], node_name="testing/avg_q_value", tag="testing/avg_q_value")
+            q_estimator.summary_writer.add_summary(episode_summary, total_t)
+            q_estimator.summary_writer.flush()
+
+
         # Reset the environment
         state = env.reset()
         state = state_processor.process(sess, state)
         state = np.stack([state] * 4, axis=2)
         # run the estimator and get all values
         q_values = q_estimator.predict(sess, np.expand_dims(state, 0))[0]
+        avg_q_value = np.mean(q_values)
+        rewards = []
 
         option_done = True
         option = None
@@ -396,9 +479,8 @@ def deep_q_learning(sess,
                 copy_model_parameters(sess, q_estimator, target_estimator)
                 print("\nCopied model parameters to target network.")
 
-
-            # select a new option
             if option_done:
+                # select a new option
                 option_probs = policy.option_prob(q_values, epsilon)
                 option = np.random.choice(np.arange(len(option_probs)), p=option_probs)
                 option_switches += 1
@@ -417,8 +499,9 @@ def deep_q_learning(sess,
             replay_memory.append(Transition(state, option, action, reward, next_state, done))
 
             # Update statistics
-            stats.episode_rewards[i_episode] += reward
-            stats.episode_lengths[i_episode] = t
+            training_stats.episode_rewards[i_episode] += reward
+            training_stats.episode_lengths[i_episode] = t
+            rewards.append(reward)
 
             # Sample a minibatch from the replay memory
             samples = random.sample(replay_memory, batch_size)
@@ -483,33 +566,42 @@ def deep_q_learning(sess,
                 break
             # get the next set of q values
             q_values = q_estimator.predict(sess, np.expand_dims(next_state, 0))[0]
+            avg_q_value += np.mean(q_values)
             # decide whether to terminate option
             beta_probs = policy.beta_prob(q_values, option, epsilon)
             option_done = np.random.choice(np.arange(2), p=beta_probs)
 
             state = next_state
             total_t += 1
-        stats.option_lengths[i_episode] = float(t)/option_switches
+        training_stats.option_lengths[i_episode] = float(t)/option_switches
+        training_stats.avg_q_value[i_episode] = avg_q_value/t
+        avg_return = 0
+        gamma_geometric_sum = 1
+        for (k, r) in enumerate(rewards):
+            avg_return += r * gamma_geometric_sum
+            gamma_geometric_sum += np.power(discount_factor, k+1)
+        training_stats.avg_discounted_return[i_episode] = avg_return/t
         # Print out which step we're on, useful for debugging.
-        print("\rStep {} ({}) @ Episode {}/{}, loss: {}".format(
-                t, total_t, i_episode + 1, num_episodes, loss), end="")
+        print("\nEpisode {}/{}, Steps {}, Reward: {}, Avg. Option Length: {:.1f}, Episode Length: {}".format(
+            i_episode + 1, num_episodes, total_t,
+            training_stats.episode_rewards[i_episode],
+            training_stats.option_lengths[i_episode],
+            training_stats.episode_lengths[i_episode]),
+            end="")
         sys.stdout.flush()
 
         # Add summaries to tensorboard
         episode_summary = tf.Summary()
-        episode_summary.value.add(simple_value=stats.episode_rewards[i_episode], node_name="episode_reward", tag="episode_reward")
-        episode_summary.value.add(simple_value=stats.episode_lengths[i_episode], node_name="episode_length", tag="episode_length")
-        episode_summary.value.add(simple_value=stats.option_lengths[i_episode], node_name="option_length", tag="option_length")
+        episode_summary.value.add(simple_value=training_stats.episode_rewards[i_episode], node_name="training/episode_reward", tag="training/episode_reward")
+        episode_summary.value.add(simple_value=training_stats.episode_lengths[i_episode], node_name="training/episode_length", tag="training/episode_length")
+        episode_summary.value.add(simple_value=training_stats.option_lengths[i_episode], node_name="training/option_length", tag="training/option_length")
+        episode_summary.value.add(simple_value=training_stats.avg_discounted_return[i_episode], node_name="training/avg_discounted_return", tag="training/avg_discounted_return")
+        episode_summary.value.add(simple_value=training_stats.avg_q_value[i_episode], node_name="training/avg_q_value", tag="training/avg_q_value")
         q_estimator.summary_writer.add_summary(episode_summary, total_t)
         q_estimator.summary_writer.flush()
 
-        yield total_t, EpisodeStats(
-            episode_lengths=stats.episode_lengths[:i_episode+1],
-            option_lengths=stats.option_lengths[:i_episode+1],
-            episode_rewards=stats.episode_rewards[:i_episode+1])
-
-    env.monitor.close()
-    return stats
+    # env.monitor.close()
+    return training_stats
 
 
 tf.reset_default_graph()
@@ -530,24 +622,20 @@ state_processor = StateProcessor()
 
 with tf.Session() as sess:
     sess.run(tf.global_variables_initializer())
-    for t, stats in deep_q_learning(sess,
-                                    env,
-                                    q_estimator=q_estimator,
-                                    target_estimator=target_estimator,
-                                    state_processor=state_processor,
-                                    experiment_dir=experiment_dir,
-                                    num_episodes=100000,
-                                    replay_memory_size=500000,
-                                    replay_memory_init_size=50000,
-                                    update_target_estimator_every=10000,
-                                    epsilon_start=1.0,
-                                    epsilon_end=0.1,
-                                    epsilon_decay_steps=1000000,
-                                    discount_factor=0.99,
-                                    zeta=1.05,
-                                    num_options=NUM_OPTIONS,
-                                    batch_size=32):
-
-        print("\nEpisode Reward: {}".format(stats.episode_rewards[-1]))
-
-
+    deep_q_learning(sess,
+        env,
+        q_estimator=q_estimator,
+        target_estimator=target_estimator,
+        state_processor=state_processor,
+        experiment_dir=experiment_dir,
+        num_episodes=1000000,
+        replay_memory_size=1000000,
+        replay_memory_init_size=50000,
+        update_target_estimator_every=10000,
+        epsilon_start=1.0,
+        epsilon_end=0.1,
+        epsilon_decay_steps=1000000,
+        discount_factor=0.99,
+        zeta=1.05,
+        num_options=NUM_OPTIONS,
+        batch_size=32)
