@@ -7,6 +7,7 @@ import random
 import sys
 import tensorflow as tf
 import time
+import pickle
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   # see issue #152
 os.environ["CUDA_VISIBLE_DEVICES"]="1"
@@ -19,6 +20,7 @@ if "../" not in sys.path:
 from collections import deque, namedtuple
 
 EpisodeStats = namedtuple("Stats",["episode_lengths", "option_lengths", "episode_rewards", "avg_q_value", "avg_discounted_return"])
+Transition = namedtuple("Transition", ["state", "option", "action", "reward", "next_state", "done"])
 
 env = gym.envs.make("Breakout-v0")
 env.frameskip=4
@@ -253,8 +255,8 @@ def deep_q_learning(sess,
                     epsilon_decay_steps=500000,
                     batch_size=32,
                     record_video_every=200,
-                    save_every=200,
-                    test_every=20):
+                    save_every=500,
+                    test_every=50):
     """
     Q-Learning algorithm for off-policy TD control using Function Approximation.
     Finds the optimal greedy policy while following an epsilon-greedy policy.
@@ -284,7 +286,6 @@ def deep_q_learning(sess,
         An EpisodeStats object with two numpy arrays for episode_lengths and episode_rewards.
     """
 
-    Transition = namedtuple("Transition", ["state", "option", "action", "reward", "next_state", "done"])
 
     # The replay memory
     replay_memory = []
@@ -379,6 +380,7 @@ def deep_q_learning(sess,
         # Save the current checkpoint
         if i_episode % save_every == 0:
             saver.save(tf.get_default_session(), checkpoint_path, global_step=global_step)
+            pickle.dump(replay_memory, open(os.path.join(checkpoint_dir, 'experience_replay.pkl'), 'wb'))
 
         if i_episode % test_every == 0:
             # run a testing episode
@@ -465,7 +467,7 @@ def deep_q_learning(sess,
         option_switches = 0
         loss = None
         # sample random actions for a random amount of time to initialize agent differently each episode
-        initial_random_steps = np.random.randint(0, 31)
+        initial_random_steps = np.random.randint(0, 7)
 
         # One step in the environment
         for t in itertools.count():
@@ -565,6 +567,7 @@ def deep_q_learning(sess,
             states_batch = np.array(states_batch)
             loss = q_estimator.update(sess, states_batch, action_batch, option_batch, targets_batch)
 
+            total_t += 1
             if done:
                 break
             # get the next set of q values
@@ -575,7 +578,6 @@ def deep_q_learning(sess,
             option_done = np.random.choice(np.arange(2), p=beta_probs)
 
             state = next_state
-            total_t += 1
         training_stats.episode_lengths[i_episode] = t
         training_stats.episode_rewards[i_episode] = np.sum(rewards)
         training_stats.option_lengths[i_episode] = float(t)/option_switches
