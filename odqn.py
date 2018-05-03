@@ -6,6 +6,7 @@ import os
 import random
 import sys
 import tensorflow as tf
+import time
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   # see issue #152
 os.environ["CUDA_VISIBLE_DEVICES"]="1"
@@ -373,10 +374,11 @@ def deep_q_learning(sess,
                   # video_callable=lambda count: count % record_video_every ==0)
 
     for i_episode in range(num_episodes):
+        start_time = time.time()
 
         # Save the current checkpoint
         if i_episode % save_every == 0:
-            saver.save(tf.get_default_session(), checkpoint_path)
+            saver.save(tf.get_default_session(), checkpoint_path, global_step=global_step)
 
         if i_episode % test_every == 0:
             # run a testing episode
@@ -582,11 +584,12 @@ def deep_q_learning(sess,
             gamma_geometric_sum += np.power(discount_factor, k+1)
         training_stats.avg_discounted_return[i_episode] = avg_return/t
         # Print out which step we're on, useful for debugging.
-        print("\nEpisode {}/{}, Steps {}, Reward: {}, Avg. Option Length: {:.1f}, Episode Length: {}".format(
+        print("\nEpisode {}/{}, Steps {}, Reward: {}, Avg. Option Length: {:.1f}, Episode Length: {}, Avg. time per step (ms) {:.0f}".format(
             i_episode + 1, num_episodes, total_t,
             training_stats.episode_rewards[i_episode],
             training_stats.option_lengths[i_episode],
-            training_stats.episode_lengths[i_episode]),
+            training_stats.episode_lengths[i_episode],
+	    1000*(time.time() - start_time)/t),
             end="")
         sys.stdout.flush()
 
