@@ -497,6 +497,7 @@ def deep_q_learning(sess,
             next_state, reward, done, _ = env.step(VALID_ACTIONS[action])
             next_state = state_processor.process(sess, next_state)
             next_state = np.append(state[:,:,1:], np.expand_dims(next_state, 2), axis=2)
+            rewards.append(reward)
 
             if t > initial_random_steps:
                 # If our replay memory is full, pop the first element
