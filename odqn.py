@@ -112,7 +112,7 @@ class Estimator():
         self.loss = tf.reduce_mean(self.losses)
 
         # Optimizer Parameters from original paper
-        self.optimizer = tf.train.RMSPropOptimizer(0.00025, 0.99, 0.0, 1e-6)
+        self.optimizer = tf.train.RMSPropOptimizer(0.00025, 0.95, 0.95, 0.01)
         self.train_op = self.optimizer.minimize(self.loss, global_step=tf.contrib.framework.get_global_step())
 
         # Summaries for Tensorboard
@@ -464,6 +464,8 @@ def deep_q_learning(sess,
         option = None
         option_switches = 0
         loss = None
+        # sample random actions for a random amount of time to initialize agent differently each episode
+        initial_random_steps = np.random.randint(0, 31)
 
         # One step in the environment
         for t in itertools.count():
@@ -487,23 +489,21 @@ def deep_q_learning(sess,
                 option = np.random.choice(np.arange(len(option_probs)), p=option_probs)
                 option_switches += 1
             # Take a step
-            action_probs = policy.action_prob(q_values, option, epsilon)
-            action = np.random.choice(np.arange(len(action_probs)), p=action_probs)
+            if t < initial_random_steps:
+                action = env.action_space.sample()
+            else:
+                action_probs = policy.action_prob(q_values, option, epsilon)
+                action = np.random.choice(np.arange(len(action_probs)), p=action_probs)
             next_state, reward, done, _ = env.step(VALID_ACTIONS[action])
             next_state = state_processor.process(sess, next_state)
             next_state = np.append(state[:,:,1:], np.expand_dims(next_state, 2), axis=2)
 
-            # If our replay memory is full, pop the first element
-            if len(replay_memory) == replay_memory_size:
-                replay_memory.pop(0)
-
-            # Save transition to replay memory
-            replay_memory.append(Transition(state, option, action, reward, next_state, done))
-
-            # Update statistics
-            training_stats.episode_rewards[i_episode] += reward
-            training_stats.episode_lengths[i_episode] = t
-            rewards.append(reward)
+            if t > initial_random_steps:
+                # If our replay memory is full, pop the first element
+                if len(replay_memory) == replay_memory_size:
+                    replay_memory.pop(0)
+                # Save transition to replay memory
+                replay_memory.append(Transition(state, option, action, reward, next_state, done))
 
             # Sample a minibatch from the replay memory
             samples = random.sample(replay_memory, batch_size)
@@ -575,6 +575,8 @@ def deep_q_learning(sess,
 
             state = next_state
             total_t += 1
+        training_stats.episode_lengths[i_episode] = t
+        training_stats.episode_rewards[i_episode] = np.sum(rewards)
         training_stats.option_lengths[i_episode] = float(t)/option_switches
         training_stats.avg_q_value[i_episode] = avg_q_value/t
         avg_return = 0
